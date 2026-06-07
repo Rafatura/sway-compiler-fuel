@@ -1,0 +1,8 @@
+{
+  "name": "sway-compiler-fuel",
+  "version": "1.0.0",
+  "dependencies": {
+    "express": "^4.18.2",
+    "uuid": "^9.0.0"
+  }
+}
