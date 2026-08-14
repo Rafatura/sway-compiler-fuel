@@ -63,17 +63,30 @@ license = "Apache-2.0"
 
     console.log(`[Compiler] Código Sway escrito em ${tmpDir}`);
 
-    // Compilar com forc
-    console.log(`[Compiler] Executando: forc build --release`);
-    const output = execSync(`cd ${tmpDir} && forc build --release 2>&1`, {
-      encoding: 'utf-8',
-      timeout: 60000,
-    });
+    // Compilar com forc em modo debug para reduzir uso de CPU/memória no Render
+    const forcBin = process.env.FORC_BIN || 'forc';
+    const projectName = sanitizeName(tokenName);
+    console.log(`[compile] Iniciando forc para ${projectName}...`);
+    console.log(`[compile] tmpDir: ${tmpDir}`);
+    console.log(`[compile] forc: ${forcBin}`);
+
+    let output;
+    try {
+      output = execSync(`cd ${tmpDir} && ${forcBin} build --path ${tmpDir} 2>&1`, {
+        encoding: 'utf-8',
+        timeout: 25_000,
+      });
+    } catch (compileError) {
+      if (compileError?.code === 'ETIMEDOUT' || compileError?.signal === 'SIGTERM') {
+        throw new Error('A compilação excedeu o limite de 25 segundos. Tente novamente ou reduza a complexidade do contrato.');
+      }
+      throw compileError;
+    }
 
     console.log(`[Compiler] Output:\n${output}`);
 
-    // Ler bytecode
-    const bytecodeFile = path.join(tmpDir, 'out', 'release', `${sanitizeName(tokenName)}.bin`);
+    // Ler bytecode de debug (sem --release)
+    const bytecodeFile = path.join(tmpDir, 'out', 'debug', `${projectName}.bin`);
     if (!fs.existsSync(bytecodeFile)) {
       throw new Error(`Bytecode file not found at ${bytecodeFile}`);
     }
@@ -101,7 +114,7 @@ license = "Apache-2.0"
     res.status(500).json({
       success: false,
       error: error.message || 'Compilation failed',
-      details: error.stderr || error.toString(),
+      details: error.stdout || error.stderr || error.toString(),
     });
   }
 });
@@ -137,6 +150,7 @@ use std::{
     identity::Identity,
     auth::msg_sender,
     constants::DEFAULT_SUB_ID,
+    string::String,
 };
 
 abi ${sanitizeName(tokenName)} {
@@ -144,10 +158,10 @@ abi ${sanitizeName(tokenName)} {
     fn get_balance() -> u64;
     
     #[storage(read)]
-    fn get_name() -> str[32];
+    fn get_name() -> String;
     
     #[storage(read)]
-    fn get_symbol() -> str[10];
+    fn get_symbol() -> String;
     
     #[storage(read)]
     fn get_decimals() -> u8;
@@ -155,8 +169,6 @@ abi ${sanitizeName(tokenName)} {
 
 storage {
     balance: u64 = ${totalSupply},
-    name: str[32] = "${tokenName}",
-    symbol: str[10] = "${tokenSymbol}",
     decimals: u8 = ${decimals},
 }
 
@@ -167,13 +179,13 @@ impl ${sanitizeName(tokenName)} for Contract {
     }
     
     #[storage(read)]
-    fn get_name() -> str[32] {
-        storage.name.read()
+    fn get_name() -> String {
+        String::from_ascii_str("${escapeSwayString(tokenName)}")
     }
     
     #[storage(read)]
-    fn get_symbol() -> str[10] {
-        storage.symbol.read()
+    fn get_symbol() -> String {
+        String::from_ascii_str("${escapeSwayString(tokenSymbol)}")
     }
     
     #[storage(read)]
@@ -192,6 +204,14 @@ function sanitizeName(name) {
     .replace(/[^a-zA-Z0-9_]/g, '_')
     .replace(/^[0-9]/, '_$&')
     .substring(0, 30);
+}
+
+function escapeSwayString(value) {
+  return String(value)
+    .replace(/\\/g, '\\\\')
+    .replace(/"/g, '\\"')
+    .replace(/\r/g, '\\r')
+    .replace(/\n/g, '\\n');
 }
 
 // Iniciar servidor
