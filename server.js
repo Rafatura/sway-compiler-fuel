@@ -29,7 +29,7 @@ function findForc() {
   }
   try {
     const r = spawnSync('which', ['forc'], { encoding: 'utf-8' });
-    if (r.stdout?.trim()) return r.stdout.trim();
+    if (r.stdout && r.stdout.trim && r.stdout.trim()) return r.stdout.trim();
   } catch {}
   return null;
 }
@@ -57,7 +57,7 @@ app.post('/compile', async (req, res) => {
     console.log(`[compile] forc: ${forcBin}`);
 
     execSync(
-      `ulimit -v 768000 && ${forcBin} build --path ${tmpDir}`,
+      `${forcBin} build --path ${tmpDir}`,
       { stdio: 'pipe', encoding: 'utf-8', timeout: 25_000, shell: '/bin/bash' }
     );
 
@@ -79,7 +79,7 @@ app.post('/compile', async (req, res) => {
     return res.json({ success: true, bytecode, abi, swayCode });
 
   } catch (err) {
-    const isTimeout = err.signal === 'SIGTERM' || err.code === 'ETIMEDOUT';
+    const isTimeout = (err && (err.signal === 'SIGTERM' || err.code === 'ETIMEDOUT'));
     const forc_error = isTimeout
       ? 'Timeout: forc demorou mais de 25s.'
       : [err.stdout, err.stderr, err.message].filter(Boolean).join('\n').trim();
@@ -97,7 +97,8 @@ app.get('/health', (_req, res) => {
   if (!forc) return res.status(503).json({ status: 'degraded', forc: 'not found' });
   const v   = spawnSync(forc, ['--version'], { encoding: 'utf-8' });
   const mem = process.memoryUsage();
-  res.json({ status: 'ok', forc, version: v.stdout?.trim(), memory_mb: Math.round(mem.rss / 1024 / 1024) });
+  const vStr = (v.stdout && v.stdout.trim) ? v.stdout.trim() : 'unknown';
+  res.json({ status: 'ok', forc, version: vStr, memory_mb: Math.round(mem.rss / 1024 / 1024) });
 });
 
 app.listen(PORT, () => {
