@@ -1,223 +1,106 @@
 const express = require('express');
+const fs      = require('fs');
+const path    = require('path');
+const os      = require('os');
+const { execSync, spawnSync } = require('child_process');
 const { v4: uuidv4 } = require('uuid');
-const { execSync } = require('child_process');
-const fs = require('fs');
-const path = require('path');
-const os = require('os');
 
-const app = express();
-const PORT = process.env.PORT || 3001;
+const app     = express();
+const PORT    = process.env.PORT || 3001;
 const API_KEY = process.env.COMPILE_API_KEY || 'agribrazil-2026';
 
-// Middleware
-app.use(express.json({ limit: '10mb' }));
+app.use(express.json({ limit: '2mb' }));
 
-// Verificar API key
-const verifyApiKey = (req, res, next) => {
-  const key = req.headers['x-api-key'];
-  if (key !== API_KEY) {
-    return res.status(401).json({ error: 'Unauthorized: Invalid API key' });
-  }
+app.use((req, res, next) => {
+  if (req.path === '/health') return next();
+  if (req.headers['x-api-key'] !== API_KEY)
+    return res.status(401).json({ error: 'Unauthorized' });
   next();
-};
+});
 
-/**
- * Compila código Sway para bytecode
- * POST /compile
- * Body: { tokenName, tokenSymbol, decimals, totalSupply, swayCode? }
- */
-app.post('/compile', verifyApiKey, async (req, res) => {
+function findForc() {
+  const candidates = [
+    '/root/.fuelup/bin/forc',
+    '/home/ubuntu/.fuelup/bin/forc',
+    '/usr/local/bin/forc',
+  ];
+  for (const p of candidates) {
+    if (fs.existsSync(p)) return p;
+  }
   try {
-    const { tokenName, tokenSymbol, decimals, totalSupply, swayCode } = req.body;
+    const r = spawnSync('which', ['forc'], { encoding: 'utf-8' });
+    if (r.stdout?.trim()) return r.stdout.trim();
+  } catch {}
+  return null;
+}
 
-    // Validar entrada
-    if (!tokenName || !tokenSymbol || decimals === undefined || !totalSupply) {
-      return res.status(400).json({
-        error: 'Missing required fields: tokenName, tokenSymbol, decimals, totalSupply',
-      });
-    }
+app.post('/compile', async (req, res) => {
+  const { tokenName, tokenSymbol, decimals, totalSupply, swayCode: incomingCode } = req.body;
 
-    console.log(`[Compiler] Compilando token: ${tokenName} (${tokenSymbol})`);
+  const forcBin = findForc();
+  if (!forcBin) {
+    return res.status(500).json({ success: false, error: 'forc não encontrado.' });
+  }
 
-    // Gerar código Sway se não fornecido
-    let code = swayCode;
-    if (!code) {
-      code = generateSwayCode(tokenName, tokenSymbol, decimals, totalSupply);
-    }
+  const projectName = (tokenSymbol || 'token').toLowerCase().replace(/[^a-z0-9_]/g, '_');
+  const tmpDir      = path.join(os.tmpdir(), `sway-${uuidv4().replace(/-/g,'')}`);
+  const swayCode    = incomingCode || `contract;`;
+  const forcToml    = `[project]\nname = "${projectName}"\nversion = "0.1.0"\nedition = "2024"\nlicense = "Apache-2.0"\n`;
 
-    // Criar diretório temporário
-    const tmpDir = path.join(os.tmpdir(), `sway-${uuidv4()}`);
-    const srcDir = path.join(tmpDir, 'src');
-    fs.mkdirSync(srcDir, { recursive: true });
-
-    // Escrever Forc.toml
-    const forcToml = `[project]
-name = "${sanitizeName(tokenName)}"
-entry = "main.sw"
-license = "Apache-2.0"
-`;
+  try {
+    fs.mkdirSync(path.join(tmpDir, 'src'), { recursive: true });
     fs.writeFileSync(path.join(tmpDir, 'Forc.toml'), forcToml);
+    fs.writeFileSync(path.join(tmpDir, 'src', 'main.sw'), swayCode);
 
-    // Escrever código Sway
-    fs.writeFileSync(path.join(srcDir, 'main.sw'), code);
-
-    console.log(`[Compiler] Código Sway escrito em ${tmpDir}`);
-
-    // Compilar com forc em modo debug para reduzir uso de CPU/memória no Render
-    const forcBin = process.env.FORC_BIN || 'forc';
-    const projectName = sanitizeName(tokenName);
     console.log(`[compile] Iniciando forc para ${projectName}...`);
     console.log(`[compile] tmpDir: ${tmpDir}`);
     console.log(`[compile] forc: ${forcBin}`);
 
-    let output;
-    try {
-      output = execSync(`cd ${tmpDir} && ${forcBin} build --path ${tmpDir} 2>&1`, {
-        encoding: 'utf-8',
-        timeout: 25_000,
-      });
-    } catch (compileError) {
-      if (compileError?.code === 'ETIMEDOUT' || compileError?.signal === 'SIGTERM') {
-        throw new Error('A compilação excedeu o limite de 25 segundos. Tente novamente ou reduza a complexidade do contrato.');
-      }
-      throw compileError;
+    execSync(
+      `ulimit -v 768000 && ${forcBin} build --path ${tmpDir}`,
+      { stdio: 'pipe', encoding: 'utf-8', timeout: 25_000, shell: '/bin/bash' }
+    );
+
+    const binPath = path.join(tmpDir, 'out', 'debug', `${projectName}.bin`);
+    const abiPath = path.join(tmpDir, 'out', 'debug', `${projectName}-abi.json`);
+
+    console.log(`[compile] Procurando bytecode em: ${binPath}`);
+
+    if (!fs.existsSync(binPath)) {
+      return res.status(500).json({ success: false, error: 'Bytecode não gerado.' });
     }
 
-    console.log(`[Compiler] Output:\n${output}`);
+    const bytecode = fs.readFileSync(binPath).toString('hex');
+    const abi      = fs.existsSync(abiPath)
+      ? JSON.parse(fs.readFileSync(abiPath, 'utf-8'))
+      : null;
 
-    // Ler bytecode de debug (sem --release)
-    const bytecodeFile = path.join(tmpDir, 'out', 'debug', `${projectName}.bin`);
-    if (!fs.existsSync(bytecodeFile)) {
-      throw new Error(`Bytecode file not found at ${bytecodeFile}`);
-    }
+    console.log(`[compile] Sucesso! ${bytecode.length / 2} bytes`);
+    return res.json({ success: true, bytecode, abi, swayCode });
 
-    const bytecodeBuffer = fs.readFileSync(bytecodeFile);
-    const bytecodeHex = bytecodeBuffer.toString('hex');
+  } catch (err) {
+    const isTimeout = err.signal === 'SIGTERM' || err.code === 'ETIMEDOUT';
+    const forc_error = isTimeout
+      ? 'Timeout: forc demorou mais de 25s.'
+      : [err.stdout, err.stderr, err.message].filter(Boolean).join('\n').trim();
 
-    console.log(`[Compiler] Bytecode gerado: ${bytecodeHex.length} caracteres`);
+    console.error(`[compile] Erro: ${forc_error.slice(0, 500)}`);
+    return res.status(400).json({ success: false, error: forc_error });
 
-    // Limpar diretório temporário
-    fs.rmSync(tmpDir, { recursive: true, force: true });
-
-    res.json({
-      success: true,
-      bytecode: bytecodeHex,
-      bytecodeSize: bytecodeBuffer.length,
-      tokenName,
-      tokenSymbol,
-      decimals,
-      totalSupply,
-    });
-  } catch (error) {
-    console.error(`[Compiler] Erro:`, error);
-
-    res.status(500).json({
-      success: false,
-      error: error.message || 'Compilation failed',
-      details: error.stdout || error.stderr || error.toString(),
-    });
+  } finally {
+    try { fs.rmSync(tmpDir, { recursive: true, force: true }); } catch {}
   }
 });
 
-/**
- * Health check
- * GET /health
- */
-app.get('/health', (req, res) => {
-  try {
-    const forcVersion = execSync('forc --version', { encoding: 'utf-8' }).trim();
-    res.json({
-      status: 'ok',
-      forc: forcVersion,
-      timestamp: new Date().toISOString(),
-    });
-  } catch (error) {
-    res.status(500).json({
-      status: 'error',
-      error: 'forc not available',
-    });
-  }
+app.get('/health', (_req, res) => {
+  const forc = findForc();
+  if (!forc) return res.status(503).json({ status: 'degraded', forc: 'not found' });
+  const v   = spawnSync(forc, ['--version'], { encoding: 'utf-8' });
+  const mem = process.memoryUsage();
+  res.json({ status: 'ok', forc, version: v.stdout?.trim(), memory_mb: Math.round(mem.rss / 1024 / 1024) });
 });
 
-/**
- * Gera código Sway para um token SRC-20
- */
-function generateSwayCode(tokenName, tokenSymbol, decimals, totalSupply) {
-  return `contract;
-
-use std::{
-    asset::mint_to,
-    identity::Identity,
-    auth::msg_sender,
-    constants::DEFAULT_SUB_ID,
-    string::String,
-};
-
-abi ${sanitizeName(tokenName)} {
-    #[storage(read)]
-    fn get_balance() -> u64;
-    
-    #[storage(read)]
-    fn get_name() -> String;
-    
-    #[storage(read)]
-    fn get_symbol() -> String;
-    
-    #[storage(read)]
-    fn get_decimals() -> u8;
-}
-
-storage {
-    balance: u64 = ${totalSupply},
-    decimals: u8 = ${decimals},
-}
-
-impl ${sanitizeName(tokenName)} for Contract {
-    #[storage(read)]
-    fn get_balance() -> u64 {
-        storage.balance.read()
-    }
-    
-    #[storage(read)]
-    fn get_name() -> String {
-        String::from_ascii_str("${escapeSwayString(tokenName)}")
-    }
-    
-    #[storage(read)]
-    fn get_symbol() -> String {
-        String::from_ascii_str("${escapeSwayString(tokenSymbol)}")
-    }
-    
-    #[storage(read)]
-    fn get_decimals() -> u8 {
-        storage.decimals.read()
-    }
-}
-`;
-}
-
-/**
- * Sanitiza nome para usar como identificador Sway
- */
-function sanitizeName(name) {
-  return name
-    .replace(/[^a-zA-Z0-9_]/g, '_')
-    .replace(/^[0-9]/, '_$&')
-    .substring(0, 30);
-}
-
-function escapeSwayString(value) {
-  return String(value)
-    .replace(/\\/g, '\\\\')
-    .replace(/"/g, '\\"')
-    .replace(/\r/g, '\\r')
-    .replace(/\n/g, '\\n');
-}
-
-// Iniciar servidor
 app.listen(PORT, () => {
-  console.log(`[Server] Sway Compiler Service rodando em porta ${PORT}`);
-  console.log(`[Server] API Key: ${API_KEY}`);
-  console.log(`[Server] Health check: GET /health`);
-  console.log(`[Server] Compilar: POST /compile`);
+  console.log(`AgriBrazil Sway Compiler v2 - Porta ${PORT}`);
+  console.log(`forc: ${findForc() || 'não encontrado'}`);
 });
